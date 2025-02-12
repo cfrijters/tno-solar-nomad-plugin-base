@@ -6,20 +6,62 @@ from nomad.datamodel.datamodel import EntryArchive
 from nomad.datamodel.metainfo.basesections import CompositeSystemReference
 from nomad.parsing.parser import MatchingParser
 
-from tno_solar_nomad_plugin_base.jv.jv_schema import Wacom_JVMeasurement
+from tno_solar_nomad_plugin_base.jv.jv_schema import SolarCellJvCurve, Wacom_JVMeasurement, convert_into_processed_dataframe, get_encoding, get_jv_data
 
 
 class JVParser(MatchingParser):
     def parse(self, mainfile: str, archive: 'EntryArchive', logger) -> None:
-        entry = Wacom_JVMeasurement()
+        data_file = os.path.basename(mainfile)
 
-        entry.data_file = os.path.basename(mainfile)
+        with archive.m_context.raw_file(data_file, 'br') as f:
+            encoding = get_encoding(f)
 
-        archive.metadata.entry_name = os.path.basename(mainfile)
-        # set_sample_reference(archive, entry, logger, 'SD232222')
+        with archive.m_context.raw_file(data_file, 'rt', encoding=encoding) as f:
+            df = convert_into_processed_dataframe(f)
 
-        file_name = f'{os.path.basename(mainfile)}.archive.json'
-        create_archive(entry, archive, file_name)
+            for i in range(1, 5):
+                jv_dict = get_jv_data(df, i)
+
+                entry = Wacom_JVMeasurement()
+
+                # get_jv_archive(jv_dict, self.data_file, self)
+                entry.file_name = os.path.basename(data_file)
+                entry.active_area = 0.089
+                entry.jv_curve = []
+
+                entry.jv_curve.append(
+                    SolarCellJvCurve(
+                        cell_name=f'P{i} rv',
+                        voltage=jv_dict['reverse']['jv_curve']['voltage'],
+                        current_density=jv_dict['reverse']['jv_curve']['current_density'],
+                        open_circuit_voltage=jv_dict['reverse']['voc'],
+                        short_circuit_current_density=jv_dict['reverse']['jsc'],
+                        fill_factor=jv_dict['reverse']['ff'],
+                        efficiency=jv_dict['reverse']['n'],
+                        max_power_point=jv_dict['reverse']['mpp'],
+                        series_resistance=jv_dict['reverse']['rs'],
+                        shunt_resistance=jv_dict['reverse']['rsh'],
+                    )
+                )
+
+                entry.jv_curve.append(
+                    SolarCellJvCurve(
+                        cell_name=f'P{i} fw',
+                        voltage=jv_dict['forward']['jv_curve']['voltage'],
+                        current_density=jv_dict['forward']['jv_curve']['current_density'],
+                        open_circuit_voltage=jv_dict['forward']['voc'],
+                        short_circuit_current_density=jv_dict['forward']['jsc'],
+                        fill_factor=jv_dict['forward']['ff'],
+                        efficiency=jv_dict['forward']['n'],
+                        max_power_point=jv_dict['forward']['mpp'],
+                        series_resistance=jv_dict['forward']['rs'],
+                        shunt_resistance=jv_dict['forward']['rsh'],
+                    )
+                )
+
+                # entry.data_file = data_file
+                file_name = f'{os.path.basename(mainfile)}.pixel{i}.archive.json'
+                create_archive(entry, archive, file_name)
 
 
 def create_archive(entity: EntryData, archive: EntryArchive, file_name: str, overwrite: bool = False) -> bool:

@@ -29,6 +29,59 @@ class SolarCellJV(PlotSection):
         a_browser=dict(adaptor=BrowserAdaptors.RawFileAdaptor),
     )
 
+    open_circuit_voltage = Quantity(
+        type=np.dtype(np.float64),
+        unit='V',
+        shape=[],
+        description='Open circuit voltage.',
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
+    short_circuit_current_density = Quantity(
+        type=np.dtype(np.float64),
+        unit='mA / cm**2',
+        shape=[],
+        description='Short circuit current density.',
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
+    fill_factor = Quantity(
+        type=np.dtype(np.float64),
+        shape=[],
+        description='Fill factor.',
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
+    efficiency = Quantity(
+        type=np.dtype(np.float64),
+        shape=[],
+        description='Power conversion efficiency.',
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
+    max_power_point = Quantity(
+        type=np.dtype(np.float64),
+        unit='W/cm^2',
+        shape=[],
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
+    series_resistance = Quantity(
+        type=np.dtype(np.float64),
+        unit='ohm*cm**2',
+        shape=[],
+        description='The series resistance as extracted from the *J-V* curve.',
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
+    shunt_resistance = Quantity(
+        type=np.dtype(np.float64),
+        unit='ohm*cm**2',
+        shape=[],
+        description='The shunt resistance as extracted from the *J-V* curve.',
+        a_eln=ELNAnnotation(component=ELNComponentEnum.NumberEditQuantity),
+    )
+
     def derive_n_values(self):
         if self.current_density is not None:
             return len(self.current_density)
@@ -61,6 +114,9 @@ class SolarCellJvCurve(SolarCellJV):
         shape=['n_values'],
         unit='mA/cm^2',
     )
+
+    def normalize(self, archive: 'EntryArchive', logger):
+        super().normalize(archive, logger)
 
 
 class BaseMeasurement(Measurement):
@@ -120,28 +176,6 @@ class Wacom_JVMeasurement(JVMeasurement, EntryData):
 
     def normalize(self, archive: 'EntryArchive', logger):
         super(JVMeasurement, self).normalize(archive, logger)
-
-        if self.data_file:
-            with archive.m_context.raw_file(self.data_file, 'br') as f:
-                encoding = get_encoding(f)
-
-            with archive.m_context.raw_file(self.data_file, 'rt', encoding=encoding) as f:
-                jv_dict = get_jv_data(f.readlines())
-
-                # get_jv_archive(jv_dict, self.data_file, self)
-                self.file_name = os.path.basename(self.data_file)
-                self.active_area = 0.089
-                self.jv_curve = []
-
-                for curve_idx, curve in enumerate(jv_dict['jv_curve']):
-                    jv = SolarCellJvCurve(
-                        cell_name=f'Cell {curve_idx + 1}',
-                        voltage=curve['voltage'],
-                        current_density=curve['current_density'],
-                    )
-
-                    self.jv_curve.append(jv)
-
         super().normalize(archive, logger)
 
 
@@ -154,12 +188,13 @@ def get_encoding(f):
     return chardet.detect(f.read())['encoding']
 
 
-def get_jv_data(lines: str):
-    jv_dict = {}
+def convert_into_processed_dataframe(file) -> pd.DataFrame:
+    lines = file.readlines()
 
     new_lines = lines[:-6]
     tab_separated_lines = [line.strip().replace(' ', '\t') for line in new_lines]
     df = pd.DataFrame([line.split('\t') for line in tab_separated_lines], columns=['V1', 'I1', 'V2', 'I2', 'V3', 'I3', 'V4', 'I4'])
+
     # Converts the values of each column to numeric (fixes deprecation error)
     for column in df.columns:
         try:
@@ -179,90 +214,97 @@ def get_jv_data(lines: str):
     dfFW = df.iloc[index_to_split:].add_suffix('_F')
     df_combined = pd.concat([dfRV.reset_index(drop=True), dfFW.reset_index(drop=True)], axis=1)
 
+    return df_combined
+
+
+def get_jv_data(df: pd.DataFrame, pixel_index: int) -> dict:
+    jv_dict = {}
+
     # Now processing each IV set for this file
-    results = []
     rsh_fits = []  # List to store Rsh fits
     rs_fits = []  # List to store Rs fits
 
     jv_dict['jv_curve'] = []
-    for i in range(1, 5):  # Handling four IV sets
-        selected_option_deadp = 2  # TODO
 
-        max_power, Rsh, Rs, Jsc, Voc, FF, n = calculate_iv_parameters(df_combined, f'V{i}_R', f'I{i}_R', selected_option_deadp)
+    selected_option_deadp = 2  # TODO
 
-        jv_dict['jv_curve'].append({'name': f'Cell {i} Reverse', 'voltage': df_combined[f'V{i}_R'], 'current_density': df_combined[f'I{i}_R']})
+    max_power, Rsh, Rs, Jsc, Voc, FF, n = calculate_iv_parameters(df, f'V{pixel_index}_R', f'I{pixel_index}_R', selected_option_deadp)
 
-        max_power, Rsh, Rs, Jsc, Voc, FF, n = calculate_iv_parameters(df_combined, f'V{i}_F', f'I{i}_F', selected_option_deadp)
+    jv_dict['reverse'] = {'mpp': max_power, 'rsh': Rsh, 'rs': Rs, 'jsc': Jsc, 'voc': Voc, 'ff': FF, 'n': n}
+    jv_dict['reverse']['jv_curve'] = {'name': f'Cell {pixel_index} Reverse', 'voltage': df[f'V{pixel_index}_R'], 'current_density': df[f'I{pixel_index}_R']}
 
-        jv_dict['jv_curve'].append({'name': f'Cell {i} Forward', 'voltage': df_combined[f'V{i}_F'], 'current_density': df_combined[f'I{i}_F']})
+    max_power, Rsh, Rs, Jsc, Voc, FF, n = calculate_iv_parameters(df, f'V{pixel_index}_F', f'I{pixel_index}_F', selected_option_deadp)
 
-        # Calculate linear fits for Rsh and Rs for Reverse IV set
-        dfrshR = df_combined.loc[
-            (df_combined[f'V{i}_R'] >= -0.10) & (df_combined[f'V{i}_R'] < 0.25),
-            [
-                # Define dataframe for Reverse IV set (shunt resistance)
-                f'V{i}_R',
-                f'I{i}_R',
-            ],
-        ]
-        dfrsR = df_combined.loc[
-            (df_combined[f'I{i}_R'] <= -0.1) & (df_combined[f'I{i}_R'] > -30),
-            [
-                # Define dataframe for Reverse IV set (series resistance)
-                f'V{i}_R',
-                f'I{i}_R',
-            ],
-        ]
+    jv_dict['forward'] = {'mpp': max_power, 'rsh': Rsh, 'rs': Rs, 'jsc': Jsc, 'voc': Voc, 'ff': FF, 'n': n}
+    jv_dict['forward']['jv_curve'] = {'name': f'Cell {pixel_index} Forward', 'voltage': df[f'V{pixel_index}_F'], 'current_density': df[f'I{pixel_index}_F']}
 
-        if not dfrshR.empty:
-            XrshR = np.array(dfrshR[f'V{i}_R'])
-            YrshR = np.array(dfrshR[f'I{i}_R'])
-            modelrshR = np.polyfit(XrshR, YrshR, 1)
-            rsh_fits.append(modelrshR)
-        else:
-            rsh_fits.append(None)
+    # Calculate linear fits for Rsh and Rs for Reverse IV set
+    dfrshR = df.loc[
+        (df[f'V{pixel_index}_R'] >= -0.10) & (df[f'V{pixel_index}_R'] < 0.25),
+        [
+            # Define dataframe for Reverse IV set (shunt resistance)
+            f'V{pixel_index}_R',
+            f'I{pixel_index}_R',
+        ],
+    ]
+    dfrsR = df.loc[
+        (df[f'I{pixel_index}_R'] <= -0.1) & (df[f'I{pixel_index}_R'] > -30),
+        [
+            # Define dataframe for Reverse IV set (series resistance)
+            f'V{pixel_index}_R',
+            f'I{pixel_index}_R',
+        ],
+    ]
 
-        if not dfrsR.empty:
-            XrsR = np.array(dfrsR[f'V{i}_R'])
-            YrsR = np.array(dfrsR[f'I{i}_R'])
-            modelrsR = np.polyfit(XrsR, YrsR, 1)
-            rs_fits.append(modelrsR)
-        else:
-            rs_fits.append(None)
+    if not dfrshR.empty:
+        XrshR = np.array(dfrshR[f'V{pixel_index}_R'])
+        YrshR = np.array(dfrshR[f'I{pixel_index}_R'])
+        modelrshR = np.polyfit(XrshR, YrshR, 1)
+        rsh_fits.append(modelrshR)
+    else:
+        rsh_fits.append(None)
 
-        # Calculate linear fits for Rsh and Rs for Forward IV set
-        dfrshF = df_combined.loc[
-            (df_combined[f'V{i}_F'] >= -0.10) & (df_combined[f'V{i}_F'] < 0.25),
-            [
-                # Define dataframe for Forward IV set (shunt resistance)
-                f'V{i}_F',
-                f'I{i}_F',
-            ],
-        ]
-        dfrsF = df_combined.loc[
-            (df_combined[f'I{i}_F'] <= -0.10) & (df_combined[f'I{i}_F'] > -30),
-            [
-                # Define dataframe for Forward IV set (series resistance)
-                f'V{i}_F',
-                f'I{i}_F',
-            ],
-        ]
+    if not dfrsR.empty:
+        XrsR = np.array(dfrsR[f'V{pixel_index}_R'])
+        YrsR = np.array(dfrsR[f'I{pixel_index}_R'])
+        modelrsR = np.polyfit(XrsR, YrsR, 1)
+        rs_fits.append(modelrsR)
+    else:
+        rs_fits.append(None)
 
-        if not dfrshF.empty:
-            XrshF = np.array(dfrshF[f'V{i}_F'])
-            YrshF = np.array(dfrshF[f'I{i}_F'])
-            modelrshF = np.polyfit(XrshF, YrshF, 1)
-            rsh_fits.append(modelrshF)
-        else:
-            rsh_fits.append(None)
+    # Calculate linear fits for Rsh and Rs for Forward IV set
+    dfrshF = df.loc[
+        (df[f'V{pixel_index}_F'] >= -0.10) & (df[f'V{pixel_index}_F'] < 0.25),
+        [
+            # Define dataframe for Forward IV set (shunt resistance)
+            f'V{pixel_index}_F',
+            f'I{pixel_index}_F',
+        ],
+    ]
+    dfrsF = df.loc[
+        (df[f'I{pixel_index}_F'] <= -0.10) & (df[f'I{pixel_index}_F'] > -30),
+        [
+            # Define dataframe for Forward IV set (series resistance)
+            f'V{pixel_index}_F',
+            f'I{pixel_index}_F',
+        ],
+    ]
 
-        if not dfrsF.empty:
-            XrsF = np.array(dfrsF[f'V{i}_F'])
-            YrsF = np.array(dfrsF[f'I{i}_F'])
-            modelrsF = np.polyfit(XrsF, YrsF, 1)
-            rs_fits.append(modelrsF)
-        else:
-            rs_fits.append(None)
+    if not dfrshF.empty:
+        XrshF = np.array(dfrshF[f'V{pixel_index}_F'])
+        YrshF = np.array(dfrshF[f'I{pixel_index}_F'])
+        modelrshF = np.polyfit(XrshF, YrshF, 1)
+        rsh_fits.append(modelrshF)
+    else:
+        rsh_fits.append(None)
+
+    if not dfrsF.empty:
+        XrsF = np.array(dfrsF[f'V{pixel_index}_F'])
+        YrsF = np.array(dfrsF[f'I{pixel_index}_F'])
+        modelrsF = np.polyfit(XrsF, YrsF, 1)
+        rs_fits.append(modelrsF)
+    else:
+        rs_fits.append(None)
 
     return jv_dict
 
